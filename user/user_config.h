@@ -3,7 +3,7 @@
 
 typedef enum {SIG_DO_NOTHING=0, SIG_START_SERVER=2, SIG_SEND_DATA, SIG_CONSOLE_RX, SIG_CONSOLE_TX } USER_SIGNALS;
 
-#define	ESP_SLIP_ROUTER_VERSION "V1.1.1mod1"
+#define	ESP_SLIP_ROUTER_VERSION "V1.1.1mod2"
 
 #define WIFI_SSID            "ssid"
 #define WIFI_PASSWORD        "password"
@@ -41,5 +41,14 @@ typedef enum {SIG_DO_NOTHING=0, SIG_START_SERVER=2, SIG_SEND_DATA, SIG_CONSOLE_R
 //
 #define STATUS_LED  2
 #define MUX_STATUS_LED {PIN_FUNC_SELECT (PERIPHS_IO_MUX_GPIO2_U, FUNC_GPIO2);}
+
+//
+// Define this to move UART0 from default pins GPIO3/GPIO1
+// to swapped pins GPIO13/GPIO15.
+//
+// D7 / GPIO13 = UART0 RX
+// D8 / GPIO15 = UART0 TX
+//
+#define SLIP_UART_SWAP 1
 
 #endif
