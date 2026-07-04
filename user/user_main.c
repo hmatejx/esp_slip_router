@@ -20,6 +20,7 @@
 #include "ringbuf.h"
 #include "user_config.h"
 #include "config_flash.h"
+#include "wifi_profiles.h"
 
 #define user_procTaskPrio        0
 #define user_procTaskQueueLen    10
@@ -125,6 +126,68 @@ int ICACHE_FLASH_ATTR parse_str_into_tokens(char *str, char **tokens, int max_to
     return token_count;
 }
 
+#ifdef REMOTE_CONFIG
+static void ICACHE_FLASH_ATTR tcp_client_recv_cb(void *arg,
+                                                 char *data,
+                                                 unsigned short length)
+{
+    struct espconn *pespconn = (struct espconn *)arg;
+    int            index;
+    uint8_t         ch;
+
+    for (index=0; index <length; index++)
+    {
+        ch = *(data+index);
+	ringbuf_memcpy_into(console_rx_buffer, &ch, 1);
+
+        // If a complete commandline is received, then signal the main
+        // task that command is available for processing
+        if (ch == '\n')
+            system_os_post(0, SIG_CONSOLE_RX, (ETSParam) arg);
+    }
+
+    *(data+length) = 0;
+}
+
+
+static void ICACHE_FLASH_ATTR tcp_client_discon_cb(void *arg)
+{
+    os_printf("tcp_client_discon_cb(): client disconnected\n");
+    struct espconn *pespconn = (struct espconn *)arg;
+}
+
+
+/* Called when a client connects to the console server */
+static void ICACHE_FLASH_ATTR tcp_client_connected_cb(void *arg)
+{
+    char payload[128];
+    struct espconn *pespconn = (struct espconn *)arg;
+
+    os_printf("tcp_client_connected_cb(): Client connected\r\n");
+
+    //espconn_regist_sentcb(pespconn,     tcp_client_sent_cb);
+    espconn_regist_disconcb(pespconn,   tcp_client_discon_cb);
+    espconn_regist_recvcb(pespconn,     tcp_client_recv_cb);
+    espconn_regist_time(pespconn,  300, 1);  // Specific to console only
+
+    ringbuf_reset(console_rx_buffer);
+    ringbuf_reset(console_tx_buffer);
+
+    os_sprintf(payload, "CMD>");
+    espconn_sent(pespconn, payload, os_strlen(payload));
+}
+#endif
+
+#ifdef STATUS_LED
+// Timer cb function
+void ICACHE_FLASH_ATTR timer_func(void *arg)
+{
+    // Turn LED off
+    GPIO_OUTPUT_SET (STATUS_LED, 1);
+}
+#endif
+
+//-------------------------------------------------------------------------------------------------
 
 void ICACHE_FLASH_ATTR console_send_response(struct espconn *pespconn)
 {
@@ -179,30 +242,132 @@ void ICACHE_FLASH_ATTR scan_done(void *arg, STATUS status)
 }
 #endif
 
+/* Callback called when the connection state of the module with an Access Point changes */
+void ICACHE_FLASH_ATTR wifi_handle_event_cb(System_Event_t *evt)
+{
+int i;
+
+    //os_printf("wifi_handle_event_cb: ");
+    switch (evt->event)
+    {
+    case EVENT_STAMODE_CONNECTED:
+        os_printf("connect to ssid %s, channel %d\n", evt->event_info.connected.ssid, evt->event_info.connected.channel);
+        break;
+
+    case EVENT_STAMODE_DISCONNECTED:
+        os_printf("disconnect from ssid %s, reason %d\n", evt->event_info.disconnected.ssid, evt->event_info.disconnected.reason);
+	    connected = false;
+#ifdef STATUS_LED
+        // Stop LED-off timer
+        os_timer_disarm(&ptimer);
+        // Turn LED on when waiting
+        GPIO_OUTPUT_SET (STATUS_LED, 0);
+#endif
+        break;
+
+    case EVENT_STAMODE_AUTHMODE_CHANGE:
+        os_printf("mode: %d -> %d\n", evt->event_info.auth_change.old_mode, evt->event_info.auth_change.new_mode);
+        break;
+
+    case EVENT_STAMODE_GOT_IP:
+	    dns_ip = dns_getserver(0);
+
+        os_printf("ip:" IPSTR ",mask:" IPSTR ",gw:" IPSTR ",dns:" IPSTR "\n", IP2STR(&evt->event_info.got_ip.ip), IP2STR(&evt->event_info.got_ip.mask), IP2STR(&evt->event_info.got_ip.gw), IP2STR(&dns_ip));
+ #ifdef STATUS_LED
+        // Turn LED off when ready
+        GPIO_OUTPUT_SET (STATUS_LED, 1);
+        // Start LED-off timer
+        os_timer_setfn(&ptimer, timer_func, 0);
+        os_timer_arm(&ptimer, 100, 1);
+#endif
+	    my_ip = evt->event_info.got_ip.ip;
+	    connected = true;
+
+	    // Update any predefined portmaps to the new IP addr
+        for (i = 0; i<IP_PORTMAP_MAX; i++) {
+	        if(ip_portmap_table[i].valid) {
+	            ip_portmap_table[i].maddr = my_ip.addr;
+	        }
+	    }
+        break;
+
+        // Post a Server Start message as the IP has been acquired to Task with priority 0
+	system_os_post(user_procTaskPrio, SIG_START_SERVER, 0 );
+        break;
+
+    default:
+        break;
+    }
+}
+
+void ICACHE_FLASH_ATTR user_set_station_config(void)
+{
+    struct station_config stationConf;
+    char hostname[40];
+
+    /* Setup AP credentials */
+    stationConf.bssid_set = 0;
+    os_sprintf(stationConf.ssid, "%s", config.ssid);
+    os_sprintf(stationConf.password, "%s", config.password);
+    wifi_station_set_config(&stationConf);
+
+    wifi_set_event_handler_cb(wifi_handle_event_cb);
+
+    wifi_station_set_auto_connect(config.auto_connect != 0);
+}
+
+
+void ICACHE_FLASH_ATTR user_set_softap_wifi_config(void)
+{
+struct softap_config apConfig;
+
+   wifi_softap_get_config(&apConfig); // Get config first.
+
+   os_memset(apConfig.ssid, 0, 32);
+   os_sprintf(apConfig.ssid, "%s", config.ap_ssid);
+   os_memset(apConfig.password, 0, 64);
+   os_sprintf(apConfig.password, "%s", config.ap_password);
+   apConfig.channel = config.ap_channel;
+   if (!config.ap_open)
+      apConfig.authmode = AUTH_WPA_WPA2_PSK;
+   else
+      apConfig.authmode = AUTH_OPEN;
+   apConfig.ssid_len = 0;// or its actual length
+
+   apConfig.max_connection = config.max_clients; // how many stations can connect to ESP8266 softAP at most.
+   apConfig.ssid_hidden = config.ssid_hidden;
+
+   // Set ESP8266 softap config
+   wifi_softap_set_config(&apConfig);
+}
 
 void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
 {
     char cmd_line[256];
     char response[256];
-    char *tokens[6];
+    char *tokens[8];
 
     int bytes_count, nTokens, i, j;
 
     bytes_count = ringbuf_bytes_used(console_rx_buffer);
     ringbuf_memcpy_from(cmd_line, console_rx_buffer, bytes_count);
 
-    for (i=j=0; i<bytes_count; i++) {
-	if (cmd_line[i] != 8) {
-	   cmd_line[j++] = cmd_line[i];
-	} else {
-	   if (j > 0) j--;
-	}
+    for (i = j = 0; i < bytes_count; i++) {
+        // try to handle delete / backspace
+        if (cmd_line[i] == 8 || cmd_line[i] == 127) {
+            if (j > 0) {
+                j--;
+            }
+        } else {
+            cmd_line[j++] = cmd_line[i];
+        }
     }
+
     cmd_line[j] = 0;
 
-    cmd_line[bytes_count] = 0;
+    //cmd_line[bytes_count] = 0;
 
-    nTokens = parse_str_into_tokens(cmd_line, tokens, 6);
+    nTokens = parse_str_into_tokens(cmd_line, tokens, 8);
 
     if (nTokens == 0) {
 	char c = '\n';
@@ -219,6 +384,8 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
         os_sprintf(response, "quit|save|reset [factory]|lock|unlock <password>\r\n");
         ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
         os_sprintf(response, "portmap [add|remove] [TCP|UDP] <ext_port> <int_addr> <int_port>\r\n");
+        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        os_sprintf(response, "wifi [list|current|add|use|switch|clear]\r\n");
         ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
 #ifdef ALLOW_SCANNING
         os_sprintf(response, "scan");
@@ -311,8 +478,10 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
     if (strcmp(tokens[0], "save") == 0)
     {
         config_save(&config);
-	// also save the portmap table
-	blob_save(0, (uint32_t *)ip_portmap_table, sizeof(struct portmap_table) * IP_PORTMAP_MAX);
+	    // also save the portmap table
+	    blob_save(0, (uint32_t *)ip_portmap_table, sizeof(struct portmap_table) * IP_PORTMAP_MAX);
+        // also save WiFi profiles
+        wifi_profiles_save();
         os_sprintf(response, "Config saved\r\n");
         ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
         goto command_handled;
@@ -327,6 +496,179 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
         goto command_handled;
     }
 #endif
+    if (strcmp(tokens[0], "wifi") == 0)
+    {
+        int slot;
+
+        if (nTokens < 2) {
+            os_sprintf(response, "wifi [list|current|add|use|switch|clear]\r\n");
+            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            goto command_handled;
+        }
+
+        if (strcmp(tokens[1], "list") == 0)
+        {
+            int i;
+            int match = wifi_profiles_find_match(&config);
+            uint8_t active_slot = wifi_profiles_get_active_slot();
+
+            os_sprintf(response, "WiFi profiles:\r\n");
+            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+
+            for (i = 0; i < WIFI_PROFILE_COUNT; i++) {
+                const wifi_profile_t *p = wifi_profiles_get(i);
+
+                if (p != NULL && p->enabled) {
+                    os_sprintf(response, "%d: %s%s%s\r\n",
+                            i,
+                            p->ssid,
+                            (i == active_slot) ? " [default]" : "",
+                            (i == match) ? " [current]" : "");
+                } else {
+                    os_sprintf(response, "%d: <empty>\r\n", i);
+                }
+
+                ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            }
+
+            goto command_handled;
+        }
+
+        if (strcmp(tokens[1], "current") == 0)
+        {
+            int match = wifi_profiles_find_match(&config);
+
+            if (match >= 0) {
+                os_sprintf(response, "Current: %s [slot %d]\r\n", config.ssid, match);
+            } else {
+                os_sprintf(response, "Current: %s [custom]\r\n", config.ssid);
+            }
+
+            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            goto command_handled;
+        }
+
+        if (config.locked)
+        {
+            os_sprintf(response, INVALID_LOCKED);
+            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            goto command_handled;
+        }
+
+        if (strcmp(tokens[1], "add") == 0)
+        {
+            if (nTokens != 3 && nTokens != 5) {
+                os_sprintf(response, "Usage: wifi add <slot> [ssid password]\r\n");
+                ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+                goto command_handled;
+            }
+
+            slot = atoi(tokens[2]);
+
+            if (!wifi_profiles_valid_slot(slot)) {
+                os_sprintf(response, INVALID_ARG);
+                ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+                goto command_handled;
+            }
+
+            if (nTokens == 3) {
+                if (wifi_profiles_add_from_config(slot, &config) != 0) {
+                    os_sprintf(response, "WiFi profile save failed\r\n");
+                    ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+                    goto command_handled;
+                }
+            } else {
+                if (wifi_profiles_add_explicit(slot, tokens[3], tokens[4]) != 0) {
+                    os_sprintf(response, "WiFi profile save failed\r\n");
+                    ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+                    goto command_handled;
+                }
+            }
+
+            wifi_profiles_save();
+
+            os_sprintf(response, "WiFi profile %d saved\r\n", slot);
+            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            goto command_handled;
+        }
+
+        if (strcmp(tokens[1], "clear") == 0)
+        {
+            if (nTokens != 3) {
+                os_sprintf(response, "Usage: wifi clear <slot>\r\n");
+                ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+                goto command_handled;
+            }
+
+            slot = atoi(tokens[2]);
+
+            if (!wifi_profiles_valid_slot(slot)) {
+                os_sprintf(response, INVALID_ARG);
+                ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+                goto command_handled;
+            }
+
+            wifi_profiles_clear(slot);
+            wifi_profiles_save();
+
+            os_sprintf(response, "WiFi profile %d cleared\r\n", slot);
+            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            goto command_handled;
+        }
+
+        if (strcmp(tokens[1], "use") == 0 || strcmp(tokens[1], "switch") == 0)
+        {
+            int persist;
+
+            if (nTokens != 3) {
+                os_sprintf(response, "Usage: wifi use <slot> | wifi switch <slot>\r\n");
+                ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+                goto command_handled;
+            }
+
+            slot = atoi(tokens[2]);
+
+            if (!wifi_profiles_slot_enabled(slot)) {
+                os_sprintf(response, "Invalid or empty WiFi profile slot\r\n");
+                ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+                goto command_handled;
+            }
+
+            persist = (strcmp(tokens[1], "switch") == 0);
+
+            if (wifi_profiles_copy_to_config(slot, &config) != 0) {
+                os_sprintf(response, "WiFi profile switch failed\r\n");
+                ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+                goto command_handled;
+            }
+
+            config.use_ap = 0;
+
+            wifi_set_opmode(STATION_MODE);
+            user_set_station_config();
+            wifi_station_disconnect();
+            wifi_station_connect();
+
+            if (persist) {
+                wifi_profiles_set_active_slot(slot);
+                config_save(&config);
+                wifi_profiles_save();
+            }
+
+            os_sprintf(response, "WiFi %s slot %d: %s%s\r\n",
+                    persist ? "switched to" : "using",
+                    slot,
+                    config.ssid,
+                    persist ? " [saved]" : " [not saved]");
+
+            ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+            goto command_handled;
+        }
+
+        os_sprintf(response, "Invalid wifi command\r\n");
+        ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
+        goto command_handled;
+    }
     if (strcmp(tokens[0], "reset") == 0)
     {
 	if (nTokens == 2 && strcmp(tokens[1], "factory") == 0) {
@@ -334,6 +676,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
            config_save(&config);
 	   // clear saved portmap table
 	   blob_zero(0, sizeof(struct portmap_table) * IP_PORTMAP_MAX);
+       wifi_profiles_zero();
 	}
         os_printf("Restarting ... \r\n");
 	system_restart();
@@ -454,6 +797,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
             if (strcmp(tokens[1],"ssid") == 0)
             {
                 os_sprintf(config.ssid, "%s", tokens[2]);
+                wifi_profiles_set_active_slot(WIFI_PROFILE_NONE);
                 os_sprintf(response, "SSID set\r\n");
                 ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
                 goto command_handled;
@@ -462,6 +806,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
             if (strcmp(tokens[1],"password") == 0)
             {
                 os_sprintf(config.password, "%s", tokens[2]);
+                wifi_profiles_set_active_slot(WIFI_PROFILE_NONE);
                 os_sprintf(response, "Password set\r\n");
                 ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
                 goto command_handled;
@@ -551,7 +896,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
             if (strcmp(tokens[1],"dns") == 0)
             {
                 config.ap_dns.addr = ipaddr_addr(tokens[2]);
-                os_sprintf(response, "DNS address set to %d.%d.%d.%d/24\r\n", 
+                os_sprintf(response, "DNS address set to %d.%d.%d.%d/24\r\n",
 			IP2STR(&config.ap_dns));
                 ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
                 goto command_handled;
@@ -561,7 +906,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
 	    {
 		uint16_t speed = atoi(tokens[2]);
 		bool succ = system_update_cpu_freq(speed);
-		if (succ) 
+		if (succ)
 		    config.clock_speed = speed;
 		os_sprintf(response, "Clock speed update %s\r\n",
 		  succ?"successful":"failed");
@@ -572,7 +917,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
             if (strcmp(tokens[1],"addr") == 0)
             {
                 config.ip_addr.addr = ipaddr_addr(tokens[2]);
-                os_sprintf(response, "IP address set to %d.%d.%d.%d/24\r\n", 
+                os_sprintf(response, "IP address set to %d.%d.%d.%d/24\r\n",
 			IP2STR(&config.ip_addr));
                 ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
                 goto command_handled;
@@ -581,7 +926,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
             if (strcmp(tokens[1],"addr_peer") == 0)
             {
                 config.ip_addr_peer.addr = ipaddr_addr(tokens[2]);
-                os_sprintf(response, "IP peer address set to %d.%d.%d.%d/24\r\n", 
+                os_sprintf(response, "IP peer address set to %d.%d.%d.%d/24\r\n",
 			IP2STR(&config.ip_addr_peer));
                 ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
                 goto command_handled;
@@ -606,69 +951,6 @@ command_handled:
     system_os_post(0, SIG_CONSOLE_TX, (ETSParam) pespconn);
     return;
 }
-
-#ifdef REMOTE_CONFIG
-static void ICACHE_FLASH_ATTR tcp_client_recv_cb(void *arg,
-                                                 char *data,
-                                                 unsigned short length)
-{
-    struct espconn *pespconn = (struct espconn *)arg;
-    int            index;
-    uint8_t         ch;
-
-    for (index=0; index <length; index++)
-    {
-        ch = *(data+index);
-	ringbuf_memcpy_into(console_rx_buffer, &ch, 1);
-
-        // If a complete commandline is received, then signal the main
-        // task that command is available for processing
-        if (ch == '\n')
-            system_os_post(0, SIG_CONSOLE_RX, (ETSParam) arg);
-    }
-
-    *(data+length) = 0;
-}
-
-
-static void ICACHE_FLASH_ATTR tcp_client_discon_cb(void *arg)
-{
-    os_printf("tcp_client_discon_cb(): client disconnected\n");
-    struct espconn *pespconn = (struct espconn *)arg;
-}
-
-
-/* Called when a client connects to the console server */
-static void ICACHE_FLASH_ATTR tcp_client_connected_cb(void *arg)
-{
-    char payload[128];
-    struct espconn *pespconn = (struct espconn *)arg;
-
-    os_printf("tcp_client_connected_cb(): Client connected\r\n");
-
-    //espconn_regist_sentcb(pespconn,     tcp_client_sent_cb);
-    espconn_regist_disconcb(pespconn,   tcp_client_discon_cb);
-    espconn_regist_recvcb(pespconn,     tcp_client_recv_cb);
-    espconn_regist_time(pespconn,  300, 1);  // Specific to console only
-
-    ringbuf_reset(console_rx_buffer);
-    ringbuf_reset(console_tx_buffer);
-    
-    os_sprintf(payload, "CMD>");
-    espconn_sent(pespconn, payload, os_strlen(payload));
-}
-#endif
-
-#ifdef STATUS_LED
-// Timer cb function
-void ICACHE_FLASH_ATTR timer_func(void *arg)
-{
-    // Turn LED off
-    GPIO_OUTPUT_SET (STATUS_LED, 1);
-}
-#endif
-
-//-------------------------------------------------------------------------------------------------
 
 static void ICACHE_FLASH_ATTR user_procTask(os_event_t *events)
 {
@@ -709,104 +991,6 @@ static void ICACHE_FLASH_ATTR user_procTask(os_event_t *events)
     }
 }
 
-/* Callback called when the connection state of the module with an Access Point changes */
-void ICACHE_FLASH_ATTR wifi_handle_event_cb(System_Event_t *evt)
-{
-int i;
-
-    //os_printf("wifi_handle_event_cb: ");
-    switch (evt->event)
-    {
-    case EVENT_STAMODE_CONNECTED:
-        os_printf("connect to ssid %s, channel %d\n", evt->event_info.connected.ssid, evt->event_info.connected.channel);
-        break;
-
-    case EVENT_STAMODE_DISCONNECTED:
-        os_printf("disconnect from ssid %s, reason %d\n", evt->event_info.disconnected.ssid, evt->event_info.disconnected.reason);
-	    connected = false;
-#ifdef STATUS_LED
-        // Stop LED-off timer
-        os_timer_disarm(&ptimer);
-        // Turn LED on when waiting
-        GPIO_OUTPUT_SET (STATUS_LED, 0);
-#endif
-        break;
-
-    case EVENT_STAMODE_AUTHMODE_CHANGE:
-        os_printf("mode: %d -> %d\n", evt->event_info.auth_change.old_mode, evt->event_info.auth_change.new_mode);
-        break;
-
-    case EVENT_STAMODE_GOT_IP:
-	    dns_ip = dns_getserver(0);
-
-        os_printf("ip:" IPSTR ",mask:" IPSTR ",gw:" IPSTR ",dns:" IPSTR "\n", IP2STR(&evt->event_info.got_ip.ip), IP2STR(&evt->event_info.got_ip.mask), IP2STR(&evt->event_info.got_ip.gw), IP2STR(&dns_ip));
- #ifdef STATUS_LED
-        // Turn LED off when ready
-        GPIO_OUTPUT_SET (STATUS_LED, 1);
-        // Start LED-off timer
-        os_timer_setfn(&ptimer, timer_func, 0);
-        os_timer_arm(&ptimer, 100, 1);
-#endif
-	    my_ip = evt->event_info.got_ip.ip;
-	    connected = true;
-
-	    // Update any predefined portmaps to the new IP addr
-        for (i = 0; i<IP_PORTMAP_MAX; i++) {
-	        if(ip_portmap_table[i].valid) {
-	            ip_portmap_table[i].maddr = my_ip.addr;
-	        }
-	    }
-        break;
-
-        // Post a Server Start message as the IP has been acquired to Task with priority 0
-	system_os_post(user_procTaskPrio, SIG_START_SERVER, 0 );
-        break;
-
-    default:
-        break;
-    }
-}
-
-void ICACHE_FLASH_ATTR user_set_station_config(void)
-{
-    struct station_config stationConf;
-    char hostname[40];
-
-    /* Setup AP credentials */
-    stationConf.bssid_set = 0;
-    os_sprintf(stationConf.ssid, "%s", config.ssid);
-    os_sprintf(stationConf.password, "%s", config.password);
-    wifi_station_set_config(&stationConf);
-
-    wifi_set_event_handler_cb(wifi_handle_event_cb);
-
-    wifi_station_set_auto_connect(config.auto_connect != 0);
-}
-
-void ICACHE_FLASH_ATTR user_set_softap_wifi_config(void)
-{
-struct softap_config apConfig;
-
-   wifi_softap_get_config(&apConfig); // Get config first.
-    
-   os_memset(apConfig.ssid, 0, 32);
-   os_sprintf(apConfig.ssid, "%s", config.ap_ssid);
-   os_memset(apConfig.password, 0, 64);
-   os_sprintf(apConfig.password, "%s", config.ap_password);
-   apConfig.channel = config.ap_channel;
-   if (!config.ap_open)
-      apConfig.authmode = AUTH_WPA_WPA2_PSK;
-   else
-      apConfig.authmode = AUTH_OPEN;
-   apConfig.ssid_len = 0;// or its actual length
-
-   apConfig.max_connection = config.max_clients; // how many stations can connect to ESP8266 softAP at most.
-   apConfig.ssid_hidden = config.ssid_hidden;
-
-   // Set ESP8266 softap config
-   wifi_softap_set_config(&apConfig);
-}
-
 LOCAL void ICACHE_FLASH_ATTR
 softuart_write_char(char c)
 {
@@ -843,6 +1027,8 @@ struct netif *nif;
 	nif->napt = 1;
 }
 
+
+
 //-------------------------------------------------------------------------------------------------
 //Init function
 void ICACHE_FLASH_ATTR  user_init()
@@ -853,7 +1039,7 @@ ip_addr_t gw;
 // This interface number 2 is just to avoid any confusion with the WiFi-Interfaces (0 and 1)
 // Should be different in the name anyway - just to be sure
 // Matches the number in sio_open()
-char int_no = 2; 
+char int_no = 2;
 
     connected = false;
     console_rx_buffer = ringbuf_new(80);
@@ -861,7 +1047,7 @@ char int_no = 2;
 
 #ifdef DEBUG_SOFTUART
     // Initialize software uart
-    Softuart_SetPinRx(&softuart,14);	
+    Softuart_SetPinRx(&softuart,14);
     Softuart_SetPinTx(&softuart,12);
     Softuart_Init(&softuart,19200);
 
@@ -876,14 +1062,15 @@ char int_no = 2;
 #endif /* DEBUG_SOFTUART */
 
     // Load config
-    if (config_load(&config)== 0) {
-	// valid config in FLASH, can read portmap table
-	blob_load(0, (uint32_t *)ip_portmap_table, sizeof(struct portmap_table) * IP_PORTMAP_MAX);
+    if (config_load(&config) == 0) {
+        // valid config in FLASH, can read portmap table
+        blob_load(0, (uint32_t *)ip_portmap_table, sizeof(struct portmap_table) * IP_PORTMAP_MAX);
     } else {
-
-	// clear portmap table
-	blob_zero(0, sizeof(struct portmap_table) * IP_PORTMAP_MAX);
+	    // clear portmap table
+	    blob_zero(0, sizeof(struct portmap_table) * IP_PORTMAP_MAX);
     }
+    // Load wifi profiles
+    wifi_profiles_load();
 
     g_bit_rate = config.bit_rate;
     remote_console_disconnect = 0;

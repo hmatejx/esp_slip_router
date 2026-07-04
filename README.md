@@ -1,7 +1,7 @@
 # esp_slip_router
 A SLIP to WiFi router
 
-This is an implementation of a SLIP (Serial Line IP - RFC1055) router on the ESP8266. It can be used as simple (and slow) network interface to get WiFi connectivity. The ESP can act as STA or as AP. It transparently forwards any IP traffic through it. As it uses NAT no routing entries are required on the other side. 
+This is an implementation of a SLIP (Serial Line IP - RFC1055) router on the ESP8266. It can be used as simple (and slow) network interface to get WiFi connectivity. The ESP can act as STA or as AP. It transparently forwards any IP traffic through it. As it uses NAT no routing entries are required on the other side.
 
 # Docker implementation
 
@@ -27,22 +27,22 @@ make flash_latest /dev/ttyUSB0
 
 
 # Usage as STA
-In this mode the ESP connects to the internet via an AP with ssid, password and offers at UART0 a SLIP interface with IP address 192.168.240.1. This default can be changed in the file user_config.h. 
+In this mode the ESP connects to the internet via an AP with ssid, password and offers at UART0 a SLIP interface with IP address 192.168.240.1. This default can be changed in the file user_config.h.
 
 To connect a Linux-based host, start the firmware on the ESP, connect it via serial to USB, and use the following commands on the host:
 ```
 sudo slattach -L -p slip -s 115200 /dev/ttyUSB0&
 sudo ifconfig sl0 192.168.240.2 pointopoint 192.168.240.1 up mtu 1500
 ```
-now 
+now
 ```
 telnet 192.168.240.1 7777
 ```
 gives you terminal access to the esp as router. On the ESP you then enter:
 
 ```
-CMD>set ssid <your_ssid> 
-CMD>set password <your_pw> 
+CMD>set ssid <your_ssid>
+CMD>set password <your_pw>
 CMD>set use_ap 0
 CMD>save
 CMD>reset
@@ -63,17 +63,24 @@ The status LED (default: GPIO2) indicates:
 - permanently off: connected (or SoftAP active), no traffic
 - rapidly blinking: in- or outgoing traffic
 
-The default config of the router can be overwritten and persistenly saved to flash by using a console interface. This console is available via tcp port 7777 (e.g. from the host attached to the serial line - see above). 
+The default config of the router can be overwritten and persistenly saved to flash by using a console interface. This console is available via tcp port 7777 (e.g. from the host attached to the serial line - see above).
 
 The console understands the following command:
 - help: prints a short help message
 - show [stats]: prints the current config and status
-- set ssid|pasword [value]: changes the named config parameter
+- set ssid|password [value]: changes the named config parameter
 - set addr [ip-addr]: sets the IP address of the SLIP interface (default: 192.168.240.1)
 - set speed [80|160]: sets the CPU clock frequency (default: 160)
 - set bitrate [bitrate]: sets the serial bitrate to a new value
 - portmap add [TCP|UDP] _external_port_ _internal_ip_ _internal_port_: adds a port forwarding (works in STA mode)
 - portmap remove [TCP|UDP] _external_port_: deletes a port forwarding
+- wifi list: lists saved WiFi profile slots and marks the current and default profile
+- wifi current: prints the currently active WiFi network and shows whether it matches a saved profile
+- wifi add _slot_: saves the current active SSID and password into the given profile slot
+- wifi add _slot_ _ssid_ _password_: saves the given SSID and password into the given profile slot
+- wifi use _slot_: temporarily switches to the given WiFi profile without saving it as the default
+- wifi switch _slot_: switches to the given WiFi profile and saves it as the persistent default
+- wifi clear _slot_: clears the given WiFi profile slot
 - save: saves the current parameters to flash
 - quit: terminates a remote session
 - reset [factory]: resets the esp and applies the config, optionally resets WiFi params to default values
@@ -82,6 +89,8 @@ The console understands the following command:
 - scan: does a scan for APs
 
 If you want to enter non-ASCII or special characters you can use HTTP-style hex encoding (e.g. "My%20AccessPoint") or, only on the CLI, as shortcut C-style quotes with backslash (e.g. "My\ AccessPoint"). Both methods will result in a string "My AccessPoint".
+
+WiFi profiles can be stored in numbered slots to make switching between frequently used networks easier. The currently active SSID and password are still kept in the normal configuration, so existing single-network setups continue to work. A working configuration can be copied into a profile with `wifi add _slot_`, or credentials can be entered directly with `wifi add _slot_ _ssid_ _password_`. Use `wifi use _slot_` to temporarily connect to a saved profile without changing the default configuration, or `wifi switch _slot_` to connect to it and save it as the persistent default after reboot. The `wifi list` and `wifi current` commands show which profile is currently active and which one is saved as the default.
 
 # Usage as AP
 You can also turn the sides and make the ESP to work as AP - useful e.g. if you want to connect other devices to a RasPi that has no WiFi interface:
@@ -92,15 +101,15 @@ sudo slattach -L -p slip -s 115200 /dev/ttyUSB0&
 sudo ifconfig sl0 192.168.240.2 pointopoint 192.168.240.1 up mtu 1500
 sudo route add -net 192.168.4.0/24 gw 192.168.240.1
 ```
-again 
+again
 ```
 telnet 192.168.240.1 7777
 ```
 gives you terminal access to the ESP as router. On the ESP you then enter:
 
 ```
-CMD>set ap_ssid <your_ssid> 
-CMD>set ap_password <your_pw> 
+CMD>set ap_ssid <your_ssid>
+CMD>set ap_password <your_pw>
 CMD>set use_ap 1
 CMD>save
 CMD>reset
@@ -126,11 +135,11 @@ Then download this source tree in a separate directory and adjust the BUILD_AREA
 
 The source tree includes a binary version of the liblwip_open plus the required additional includes from my fork of esp-open-lwip. *No additional install action is required for that.* Only if you don't want to use the precompiled library, checkout the sources from https://github.com/martin-ger/esp-open-lwip . Use it to replace the directory "esp-open-lwip" in the esp-open-sdk tree. "make clean" in the esp_open_lwip dir and once again a "make" in the upper esp_open_sdk directory. This will compile a liblwip_open.a that contains the NAT-features. Replace liblwip_open_napt.a with that binary.
 
-If you want to use the precompiled binaries you can flash them with "esptool.py --port /dev/ttyUSB0 write_flash -fs 32m 0x00000 firmware/0x00000.bin 0x10000 firmware/0x10000.bin" (use -fs 8m for an ESP-01). 
+If you want to use the precompiled binaries you can flash them with "esptool.py --port /dev/ttyUSB0 write_flash -fs 32m 0x00000 firmware/0x00000.bin 0x10000 firmware/0x10000.bin" (use -fs 8m for an ESP-01).
 
 For Wemos D1 Mini use the following flash command:
 ```
-esptool.py --port /dev/ttyUSB0 --baud 460800 write_flash -fs 4m -fm dio 0x00000 firmware/0x00000.bin 0x10000 firmware/0x10000.bin 
+esptool.py --port /dev/ttyUSB0 --baud 460800 write_flash -fs 4m -fm dio 0x00000 firmware/0x00000.bin 0x10000 firmware/0x10000.bin
 ```
 
 # Softuart UART
