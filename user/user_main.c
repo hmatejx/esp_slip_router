@@ -385,7 +385,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
         ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
         os_sprintf(response, "portmap [add|remove] [TCP|UDP] <ext_port> <int_addr> <int_port>\r\n");
         ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
-        os_sprintf(response, "wifi [list|current|add|use|switch|clear]\r\n");
+        os_sprintf(response, "wifi [list|current|add|switch|clear]\r\n");
         ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
 #ifdef ALLOW_SCANNING
         os_sprintf(response, "scan");
@@ -501,7 +501,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
         int slot;
 
         if (nTokens < 2) {
-            os_sprintf(response, "wifi [list|current|add|use|switch|clear]\r\n");
+            os_sprintf(response, "wifi [list|current|add|switch|clear]\r\n");
             ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
             goto command_handled;
         }
@@ -616,12 +616,12 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
             goto command_handled;
         }
 
-        if (strcmp(tokens[1], "use") == 0 || strcmp(tokens[1], "switch") == 0)
+        if (strcmp(tokens[1], "switch") == 0)
         {
             int persist;
 
             if (nTokens != 3) {
-                os_sprintf(response, "Usage: wifi use <slot> | wifi switch <slot>\r\n");
+                os_sprintf(response, "Usage: wifi switch <slot>\r\n");
                 ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
                 goto command_handled;
             }
@@ -644,22 +644,16 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
 
             config.use_ap = 0;
 
-            wifi_set_opmode(STATION_MODE);
-            user_set_station_config();
-            wifi_station_disconnect();
-            wifi_station_connect();
+            wifi_profiles_set_active_slot(slot);
 
-            if (persist) {
-                wifi_profiles_set_active_slot(slot);
-                config_save(&config);
-                wifi_profiles_save();
-            }
+            config_save(&config);
+            wifi_profiles_save();
 
-            os_sprintf(response, "WiFi %s slot %d: %s%s\r\n",
-                    persist ? "switched to" : "using",
+            os_sprintf(response,
+                    "WiFi switched to slot %d: %s [saved]\r\n"
+                    "Run reset or power-cycle to apply.\r\n",
                     slot,
-                    config.ssid,
-                    persist ? " [saved]" : " [not saved]");
+                    config.ssid);
 
             ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
             goto command_handled;
@@ -669,6 +663,7 @@ void ICACHE_FLASH_ATTR console_handle_command(struct espconn *pespconn)
         ringbuf_memcpy_into(console_tx_buffer, response, os_strlen(response));
         goto command_handled;
     }
+
     if (strcmp(tokens[0], "reset") == 0)
     {
 	if (nTokens == 2 && strcmp(tokens[1], "factory") == 0) {
